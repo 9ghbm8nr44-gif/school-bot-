@@ -1,0 +1,1310 @@
+import asyncio
+import logging
+import os
+import re
+import tempfile
+import threading
+from datetime import datetime, timedelta
+from io import BytesIO
+from zoneinfo import ZoneInfo
+
+from flask import Flask
+import pytesseract
+from g4f.client import Client
+from g4f import Provider
+from PIL import Image, ImageOps
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
+web_app = Flask(__name__)
+
+
+@web_app.route("/", methods=["GET"])
+def health_check():
+    return "Bot is alive!"
+
+
+def run_keep_alive_server(port: int) -> None:
+    """Запустить лёгкий веб-сервер в отдельном потоке."""
+    try:
+        web_app.run(
+            host="0.0.0.0",
+            port=port,
+            debug=False,
+            use_reloader=False,
+        )
+    except Exception:
+        logger.exception("Keep-alive веб-сервер остановился с ошибкой")
+
+
+def start_keep_alive_server() -> None:
+    """Запустить keep-alive сервер и вывести предоставленный Replit URL."""
+    port = int(os.getenv("PORT", "5000"))
+    server_thread = threading.Thread(
+        target=run_keep_alive_server,
+        args=(port,),
+        name="keep-alive-server",
+        daemon=True,
+    )
+    server_thread.start()
+
+    dev_domain = os.getenv("REPLIT_DEV_DOMAIN", "").strip()
+    if dev_domain:
+        dev_domain = dev_domain.removeprefix("https://").removeprefix("http://")
+        server_url = f"https://{dev_domain.rstrip('/')}"
+    else:
+        server_url = f"http://0.0.0.0:{port}"
+    print(f"Web server URL: {server_url}", flush=True)
+
+
+# Главная клавиатура. Все остальные разделы используют собственные подменю.
+MENU_BUTTONS = [
+    ["📋 Задачи", "📚 Расписание уроков"],
+    ["🤖 ИИ-Решебник задач"],
+]
+MENU = ReplyKeyboardMarkup(
+    MENU_BUTTONS,
+    resize_keyboard=True,
+    input_field_placeholder="Выберите раздел",
+)
+TASKS_MENU = ReplyKeyboardMarkup(
+    [
+        ["📋 Задачи на сегодня"],
+        ["➕ Добавить задачу"],
+        ["🔙 Главное меню"],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите действие",
+)
+SCHEDULE_MENU = ReplyKeyboardMarkup(
+    [
+        ["📅 Сегодня", "📆 Завтра"],
+        ["🗓️ Вся неделя"],
+        ["✏️ Изменить расписание"],
+        ["🔙 Главное меню"],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите действие",
+)
+SUBMENU_MENU = ReplyKeyboardMarkup(
+    [
+        ["📸 Решить по фото"],
+        ["🔙 Главное меню"],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Нажмите кнопку ниже, чтобы выйти",
+)
+REMINDER_MENU = ReplyKeyboardMarkup(
+    [
+        ["✅ Да", "❌ Нет"],
+        ["🔙 Главное меню"],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите вариант",
+)
+
+ERROR_TEXT = "Произошла ошибка, попробуйте еще раз"
+INVALID_INPUT_TEXT = "Некорректный ввод, попробуйте еще раз."
+AI_ERROR_TEXT = "Ошибка получения ответа. Попробуй ещё раз."
+PHOTO_PROGRESS_TEXT = "📸 Анализирую фото и решаю задачу... Подождите несколько секунд."
+PHOTO_ERROR_TEXT = "Не удалось четко распознать условие. Попробуй сделать фото ближе и четче."
+BACK_BUTTON = "🔙 Главное меню"
+
+AI_SYSTEM_PROMPT = r"""Ты — школьный решебник. Тебе передан текст задачи.
+
+Формат ответа:
+📝 Решение:
+1. [Шаг 1]
+2. [Шаг 2]
+
+💡 Ответ: [Краткий итог]
+
+🔍 Объяснение: [1-2 предложения]
+
+Правила:
+- Пиши строго по условию, не додумывай отсутствующие данные.
+- НЕ используй LaTeX, $, \left, \right, \frac, <=ft.
+- Записывай формулы простым текстом: (b - (b^2 - 3) / (b + 1)).
+- Будь аккуратен с переменными и знаками."""
+
+PHOTO_OCR_SYSTEM_PROMPT = r"""Ты — школьный решебник. Тебе передан текст задачи, распознанный с фото (в нем могут быть мелкие опечатки).
+
+Твоя задача:
+1. Пойми, какое задание написано, исправь возможные мелкие опечатки OCR.
+2. Возьми ПЕРВОЕ задание из текста и дай его подробное решение.
+3. Формат ответа:
+📝 Решение:
+1. [Шаг 1]
+2. [Шаг 2]
+
+💡 Ответ: [Краткий итог]
+
+🔍 Объяснение: [1-2 предложения]
+
+Правила:
+- НЕ используй LaTeX, $, \left, \right, \frac, <=ft. Записывай формулы простым текстом: (b - (b^2 - 3) / (b + 1))."""
+
+WEEKDAYS = [
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+]
+ALL_WEEKDAYS = WEEKDAYS + ["Воскресенье"]
+TASK_SUBJECTS = [
+    "Математика",
+    "Русский язык",
+    "Физика",
+    "Химия",
+    "Биология",
+    "История",
+    "Английский язык",
+]
+TASK_ACTIONS = {
+    "complete": "✅ Выполнить задачу",
+    "edit": "✏️ Изменить задачу",
+    "delete": "🗑️ Удалить задачу",
+    "move": "📅 Перенести на другой день",
+}
+
+# Данные хранятся отдельно для каждого пользователя в памяти процесса.
+tasks_by_user: dict[int, list[dict[str, object]]] = {}
+schedule_by_user: dict[int, dict[str, str]] = {}
+ai_tasks_by_user: dict[int, asyncio.Task] = {}
+next_task_id = 1
+
+
+def get_user_id(update: Update) -> int | None:
+    """Получить ID пользователя."""
+    return update.effective_user.id if update.effective_user else None
+
+
+def reset_input_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбросить любой ожидающий ввод и черновик."""
+    context.user_data["mode"] = None
+    for key in (
+        "schedule_day",
+        "draft_task",
+        "task_action",
+        "selected_task_id",
+    ):
+        context.user_data.pop(key, None)
+
+
+def cancel_ai_task(user_id: int | None) -> None:
+    """Отменить незавершённый запрос ИИ пользователя."""
+    if user_id is None:
+        return
+
+    task = ai_tasks_by_user.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def reset_user_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбросить состояние пользователя и его активный запрос ИИ."""
+    cancel_ai_task(get_user_id(update))
+    reset_input_state(context)
+
+
+def submenu_navigation_text() -> str:
+    return "Для навигации используйте кнопки ниже."
+
+
+def subject_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(subject, callback_data=f"task_subject:{subject}")
+            for subject in TASK_SUBJECTS[index : index + 2]
+        ]
+        for index in range(0, len(TASK_SUBJECTS), 2)
+    ]
+    rows.append(
+        [InlineKeyboardButton("✍️ Ввести свой предмет", callback_data="task_subject:custom")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def task_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    TASK_ACTIONS["complete"],
+                    callback_data="task_action:complete",
+                ),
+                InlineKeyboardButton(
+                    TASK_ACTIONS["edit"],
+                    callback_data="task_action:edit",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    TASK_ACTIONS["delete"],
+                    callback_data="task_action:delete",
+                ),
+                InlineKeyboardButton(
+                    TASK_ACTIONS["move"],
+                    callback_data="task_action:move",
+                ),
+            ],
+        ]
+    )
+
+
+def active_tasks(user_id: int) -> list[dict[str, object]]:
+    return [
+        task
+        for task in tasks_by_user.get(user_id, [])
+        if not task.get("completed", False)
+    ]
+
+
+def find_task(user_id: int, task_id: int) -> dict[str, object] | None:
+    for task in tasks_by_user.get(user_id, []):
+        if task.get("id") == task_id:
+            return task
+    return None
+
+
+def task_line(number: int, task: dict[str, object]) -> str:
+    reminder = "вкл." if task.get("reminder") else "выкл."
+    return (
+        f"{number}. {task.get('subject', 'Без предмета')}: "
+        f"{task.get('title', '')}\n"
+        f"   📅 {task.get('date', '')} | ⏰ {task.get('deadline', '')} "
+        f"| 🔔 {reminder}"
+    )
+
+
+def tasks_text(user_id: int) -> str:
+    """Подготовить список незавершённых задач пользователя."""
+    user_tasks = active_tasks(user_id)
+    if not user_tasks:
+        return (
+            "📋 Текущих задач пока нет.\n\n"
+            "Нажмите «➕ Добавить задачу», чтобы записать новую."
+        )
+
+    lines = ["📋 Текущие задачи:", ""]
+    for number, task in enumerate(user_tasks, start=1):
+        lines.append(task_line(number, task))
+    return "\n".join(lines)
+
+
+def task_selection_keyboard(
+    user_id: int,
+    action: str,
+) -> InlineKeyboardMarkup:
+    buttons = []
+    for task in active_tasks(user_id):
+        task_id = int(task["id"])
+        title = str(task.get("title", "Без названия"))
+        subject = str(task.get("subject", ""))
+        label = f"{subject}: {title}"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label[:60],
+                    callback_data=f"task_select:{action}:{task_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons)
+
+
+def schedule_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✏️ Изменить расписание",
+                    callback_data="schedule:edit",
+                )
+            ]
+        ]
+    )
+
+
+def weekdays_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(day, callback_data=f"schedule:day:{day}")
+            for day in WEEKDAYS[index : index + 2]
+        ]
+        for index in range(0, len(WEEKDAYS), 2)
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def schedule_text(user_id: int) -> str:
+    """Подготовить расписание пользователя на всю неделю."""
+    user_schedule = schedule_by_user.get(user_id, {})
+    if not user_schedule:
+        return "📚 Расписание уроков\n\nРасписание пока не заполнено"
+
+    lines = ["📚 Расписание уроков", ""]
+    for day in WEEKDAYS:
+        lines.append(day)
+        lines.append(user_schedule.get(day, "— не заполнено"))
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def local_today() -> datetime:
+    """Получить текущее время в часовом поясе пользователя проекта."""
+    try:
+        return datetime.now(ZoneInfo("Asia/Almaty"))
+    except Exception:
+        return datetime.now()
+
+
+def schedule_day_text(user_id: int, offset: int) -> str:
+    date = local_today().date() + timedelta(days=offset)
+    day = ALL_WEEKDAYS[date.weekday()]
+    if day == "Воскресенье":
+        return f"📅 {day}, {date:%d.%m.%Y}\n\nВ этот день уроков нет"
+    lessons = schedule_by_user.get(user_id, {}).get(day)
+    if not lessons:
+        return f"📅 {day}, {date:%d.%m.%Y}\n\nРасписание на этот день пока не заполнено"
+    return f"📅 {day}, {date:%d.%m.%Y}\n\n{lessons}"
+
+
+async def send_schedule_view(
+    update: Update,
+    text: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not update.message:
+        return
+    await update.message.reply_text(text, reply_markup=schedule_keyboard())
+    await update.message.reply_text(
+        submenu_navigation_text(),
+        reply_markup=SCHEDULE_MENU,
+    )
+
+
+async def send_task_list(
+    update: Update,
+    user_id: int,
+) -> None:
+    if not update.message:
+        return
+
+    user_tasks = active_tasks(user_id)
+    if user_tasks:
+        await update.message.reply_text(
+            tasks_text(user_id),
+            reply_markup=task_actions_keyboard(),
+        )
+        await update.message.reply_text(
+            submenu_navigation_text(),
+            reply_markup=TASKS_MENU,
+        )
+    else:
+        await update.message.reply_text(
+            tasks_text(user_id),
+            reply_markup=TASKS_MENU,
+        )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать приветствие и главное меню."""
+    try:
+        reset_user_state(update, context)
+        if update.message:
+            await update.message.reply_text(
+                "Привет! Я твой школьный бот-помощник.\n"
+                "Помогу организовать задачи, расписание "
+                "и разобрать школьный вопрос.",
+                reply_markup=MENU,
+            )
+    except Exception:
+        logger.exception("Ошибка при обработке команды /start")
+        await send_error_message(update, ERROR_TEXT)
+
+
+async def show_tasks_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    reset_user_state(update, context)
+    if update.message:
+        await update.message.reply_text(
+            "📋 Раздел «Задачи». Выберите действие:",
+            reply_markup=TASKS_MENU,
+        )
+
+
+async def show_tasks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    reset_user_state(update, context)
+    user_id = get_user_id(update)
+    if user_id is not None:
+        await send_task_list(update, user_id)
+
+
+async def ask_for_task(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    reset_user_state(update, context)
+    context.user_data["mode"] = "add_task_subject"
+    context.user_data["draft_task"] = {}
+
+    if update.message:
+        await update.message.reply_text(
+            "📚 Выберите или введите предмет:",
+            reply_markup=subject_keyboard(),
+        )
+        await update.message.reply_text(
+            "Можно выбрать предмет на сообщении выше или ввести свой текст.",
+            reply_markup=TASKS_MENU,
+        )
+
+
+async def show_schedule_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    reset_user_state(update, context)
+    if update.message:
+        await update.message.reply_text(
+            "📚 Раздел «Расписание уроков». Выберите действие:",
+            reply_markup=SCHEDULE_MENU,
+        )
+
+
+async def show_schedule_editor(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    reset_user_state(update, context)
+    context.user_data["mode"] = "choose_schedule_day"
+    if update.message:
+        await update.message.reply_text(
+            "Выберите день недели для редактирования:",
+            reply_markup=weekdays_keyboard(),
+        )
+        await update.message.reply_text(
+            submenu_navigation_text(),
+            reply_markup=SCHEDULE_MENU,
+        )
+
+
+async def handle_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Обработать inline-кнопки задач, расписания и добавления."""
+    query = update.callback_query
+    if not query:
+        return
+
+    try:
+        await query.answer()
+        data = query.data or ""
+        user_id = get_user_id(update)
+        if user_id is None:
+            raise ValueError("Не найден пользователь")
+
+        if data.startswith("task_subject:"):
+            subject = data.removeprefix("task_subject:")
+            if subject == "custom":
+                context.user_data["mode"] = "add_task_subject"
+                context.user_data["draft_task"] = {}
+                await query.edit_message_text(
+                    "✍️ Введите название предмета одним сообщением."
+                )
+                return
+            if subject not in TASK_SUBJECTS:
+                raise ValueError("Неизвестный предмет")
+
+            context.user_data["draft_task"] = {"subject": subject}
+            context.user_data["mode"] = "add_task_title"
+            await query.edit_message_text(
+                f"Выбран предмет: {subject}\n\n"
+                "📝 Теперь введите название задания."
+            )
+            return
+
+        if data == "schedule:edit":
+            reset_user_state(update, context)
+            context.user_data["mode"] = "choose_schedule_day"
+            await query.edit_message_text(
+                "Выберите день недели для редактирования:",
+                reply_markup=weekdays_keyboard(),
+            )
+            return
+
+        if data.startswith("schedule:day:"):
+            day = data.removeprefix("schedule:day:")
+            if day not in WEEKDAYS:
+                raise ValueError("Неизвестный день")
+            reset_user_state(update, context)
+            context.user_data["mode"] = "add_schedule"
+            context.user_data["schedule_day"] = day
+            await query.edit_message_text(
+                f"Введите список уроков на {day} одним сообщением.\n"
+                "Например: «1. Алгебра 2. Физика 3. Геометрия»."
+            )
+            return
+
+        if data.startswith("task_action:"):
+            action = data.removeprefix("task_action:")
+            if action not in TASK_ACTIONS:
+                raise ValueError("Неизвестное действие с задачей")
+            if not active_tasks(user_id):
+                await query.edit_message_text(
+                    tasks_text(user_id),
+                )
+                reset_input_state(context)
+                return
+
+            cancel_ai_task(user_id)
+            reset_input_state(context)
+            context.user_data["mode"] = "task_select_action"
+            context.user_data["task_action"] = action
+            await query.edit_message_text(
+                f"{TASK_ACTIONS[action]}\n\nВыберите задачу:",
+                reply_markup=task_selection_keyboard(user_id, action),
+            )
+            return
+
+        if data.startswith("task_select:"):
+            parts = data.split(":")
+            if len(parts) != 3:
+                raise ValueError("Некорректная задача")
+            action, raw_task_id = parts[1], parts[2]
+            if action not in TASK_ACTIONS:
+                raise ValueError("Неизвестное действие")
+            task = find_task(user_id, int(raw_task_id))
+            if task is None or task.get("completed"):
+                raise ValueError("Задача не найдена")
+
+            if action == "complete":
+                task["completed"] = True
+                reset_input_state(context)
+                await query.edit_message_text(
+                    "✅ Задача выполнена!\n\n" + tasks_text(user_id),
+                    reply_markup=(
+                        task_actions_keyboard()
+                        if active_tasks(user_id)
+                        else None
+                    ),
+                )
+                return
+
+            if action == "delete":
+                tasks_by_user[user_id].remove(task)
+                reset_input_state(context)
+                await query.edit_message_text(
+                    "🗑️ Задача удалена.\n\n" + tasks_text(user_id),
+                    reply_markup=(
+                        task_actions_keyboard()
+                        if active_tasks(user_id)
+                        else None
+                    ),
+                )
+                return
+
+            context.user_data.pop("task_action", None)
+            context.user_data["selected_task_id"] = int(raw_task_id)
+            if action == "edit":
+                context.user_data["mode"] = "edit_task_title"
+                await query.edit_message_text(
+                    "✏️ Введите новое название задания."
+                )
+            else:
+                context.user_data["mode"] = "move_task_date"
+                await query.edit_message_text(
+                    "📅 Введите новую дату в формате ДД.ММ.ГГГГ."
+                )
+            return
+    except Exception:
+        logger.exception("Ошибка при обработке inline-кнопки")
+        reset_user_state(update, context)
+        if query.message:
+            await query.message.reply_text(
+                INVALID_INPUT_TEXT,
+                reply_markup=MENU,
+            )
+
+
+def clean_text(text: str) -> str:
+    """Очистить любой ответ ИИ от системной разметки и технического мусора."""
+    if not text:
+        return ""
+
+    text = str(text)
+
+    # Убираем системные XML/HTML-теги, включая многострочные служебные блоки.
+    text = re.sub(
+        r"<ElicitationsGroup[\s\S]*?</ElicitationsGroup>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<Elicitation\b[\s\S]*?</Elicitation>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<Elicitation[\s\S]*?>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", "", text)
+
+    # Убираем LaTeX и мусорные символы индексов.
+    text = text.replace('_{{', '_').replace('}}', '').replace('{', '').replace('}', '')
+    text = (
+        text.replace("\\times", "*")
+        .replace("\\div", "/")
+        .replace("\\pm", "+/-")
+        .replace("\\le", "<=")
+        .replace("\\ge", ">=")
+        .replace("\\neq", "!=")
+        .replace("\\text", "")
+        .replace("\\(", "")
+        .replace("\\)", "")
+        .replace("\\[", "")
+        .replace("\\]", "")
+        .replace("```", "")
+    )
+    text = re.sub(
+        r"\\left|\\right|<=ft|right\)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = text.replace('$', '').replace('\\cdot', '*').replace('\\frac', '').replace('\\', '')
+
+    # Убираем известные технические маркеры, которые иногда возвращают провайдеры.
+    text = re.sub(r"\bU\+?[0-9A-F]{5,}\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b0x[0-9A-F]{5,}\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?im)^\s*(?:retryprovidererror|responseerror|"
+        r"novalidharfileerror|traceback|stack trace)\b.*$",
+        "",
+        text,
+    )
+
+    # Убираем двойные пробелы и лишние пустые строки, сохраняя переносы.
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def is_ai_error_text(text: str) -> bool:
+    """Распознать пустой ответ или типичное английское сообщение об ошибке."""
+    normalized = text.strip().lower()
+    if not normalized:
+        return True
+
+    error_markers = (
+        "error",
+        "exception",
+        "failed to",
+        "request failed",
+        "internal server",
+        "service unavailable",
+        "timed out",
+        "timeout",
+        "rate limit",
+        "unauthorized",
+        "forbidden",
+        "bad gateway",
+        "gateway timeout",
+    )
+    return any(marker in normalized for marker in error_markers)
+
+
+async def ask_g4f(
+    question: str,
+    system_prompt: str = AI_SYSTEM_PROMPT,
+) -> str:
+    """Получить лаконичный ответ через g4f с повторными попытками."""
+    def get_response() -> str:
+        client = Client(provider=Provider.Gemini)
+        response = client.chat.completions.create(
+            model="gemini-3.6-flash",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question},
+            ],
+        )
+        return response.choices[0].message.content or ""
+
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            answer = clean_text(await asyncio.to_thread(get_response))
+            if is_ai_error_text(answer):
+                raise RuntimeError("ИИ вернул пустой ответ или сообщение об ошибке")
+            return answer
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            last_error = error
+            if attempt < 2:
+                logger.warning(
+                    "Повтор запроса ИИ: попытка %s из 3 для текущего запроса",
+                    attempt + 2,
+                )
+                await asyncio.sleep(1)
+
+    raise RuntimeError("Не удалось получить ответ от ИИ") from last_error
+
+
+def extract_text_from_photo(photo_path: str) -> str:
+    """Распознать текст с локального фото на русском и английском."""
+    with Image.open(photo_path) as image:
+        prepared_image = ImageOps.exif_transpose(image)
+        if prepared_image.mode != "RGB":
+            prepared_image = prepared_image.convert("RGB")
+
+        scale = 2 if max(prepared_image.size) < 2200 else 1
+        if scale > 1:
+            prepared_image = prepared_image.resize(
+                (
+                    prepared_image.width * scale,
+                    prepared_image.height * scale,
+                ),
+                Image.Resampling.LANCZOS,
+            )
+
+        return pytesseract.image_to_string(
+            prepared_image,
+            lang="rus+eng",
+            config="--oem 3 --psm 6",
+        ).strip()
+
+
+async def send_long_message(update: Update, text: str) -> None:
+    """Отправить длинный ответ несколькими сообщениями."""
+    if not update.message:
+        return
+    text = clean_text(text)
+    if not text:
+        return
+    for start_index in range(0, len(text), 4000):
+        await update.message.reply_text(text[start_index : start_index + 4000])
+
+
+async def send_error_message(update: Update, text: str) -> None:
+    """Сообщить пользователю об ошибке и показать главное меню."""
+    if not update.message:
+        return
+    try:
+        await update.message.reply_text(text, reply_markup=MENU)
+    except Exception:
+        logger.exception("Не удалось отправить сообщение об ошибке")
+
+
+async def process_ai_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    question: str,
+    user_id: int,
+) -> None:
+    """Выполнить запрос ИИ с повторами, таймаутом и защитой от зависания."""
+    current_task = asyncio.current_task()
+    try:
+        answer = await asyncio.wait_for(ask_g4f(question), timeout=20)
+        answer = clean_text(answer)
+        if not answer:
+            raise RuntimeError("ИИ вернул пустой ответ")
+        await send_long_message(update, answer)
+    except asyncio.CancelledError:
+        logger.info("Запрос ИИ отменён пользователем %s", user_id)
+        raise
+    except asyncio.TimeoutError:
+        logger.warning("Запрос ИИ превысил таймаут для пользователя %s", user_id)
+        reset_input_state(context)
+        if update.message:
+            await update.message.reply_text(AI_ERROR_TEXT, reply_markup=MENU)
+    except Exception:
+        logger.exception("Ошибка запроса ИИ для пользователя %s", user_id)
+        reset_input_state(context)
+        if update.message:
+            await update.message.reply_text(AI_ERROR_TEXT, reply_markup=MENU)
+    finally:
+        if ai_tasks_by_user.get(user_id) is current_task:
+            ai_tasks_by_user.pop(user_id, None)
+
+
+async def process_photo_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    photo_id: str,
+    user_id: int,
+) -> None:
+    """Скачать фото, распознать текст и решить его обычным g4f-запросом."""
+    current_task = asyncio.current_task()
+    temp_path: str | None = None
+    try:
+        telegram_file = await context.bot.get_file(photo_id)
+        file_descriptor, temp_path = tempfile.mkstemp(
+            prefix="telegram_photo_",
+            suffix=".jpg",
+        )
+        os.close(file_descriptor)
+        await telegram_file.download_to_drive(custom_path=temp_path)
+
+        with open(temp_path, "rb") as photo_file:
+            image_data = photo_file.read()
+        ocr_text = await asyncio.wait_for(
+            asyncio.to_thread(extract_text_from_photo, temp_path),
+            timeout=20,
+        )
+        ocr_text = ocr_text.strip()
+        if len(ocr_text) < 4:
+            reset_input_state(context)
+            if update.message:
+                await update.message.reply_text(
+                    PHOTO_ERROR_TEXT,
+                    reply_markup=MENU,
+                )
+            return
+
+        answer = await asyncio.wait_for(
+            ask_g4f(ocr_text, system_prompt=PHOTO_OCR_SYSTEM_PROMPT),
+            timeout=20,
+        )
+        answer = clean_text(answer)
+        if not answer:
+            raise RuntimeError("ИИ вернул пустой ответ для фото")
+        await send_long_message(update, answer)
+    except asyncio.CancelledError:
+        logger.info("Обработка фото отменена пользователем %s", user_id)
+        raise
+    except Exception:
+        logger.exception("Ошибка обработки фото для пользователя %s", user_id)
+        reset_input_state(context)
+        if update.message:
+            await update.message.reply_text(PHOTO_ERROR_TEXT, reply_markup=MENU)
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception("Не удалось удалить временный файл фото")
+        if ai_tasks_by_user.get(user_id) is current_task:
+            ai_tasks_by_user.pop(user_id, None)
+
+
+async def handle_back_to_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Первый и самый быстрый обработчик выхода в главное меню."""
+    try:
+        reset_user_state(update, context)
+        if update.message:
+            await update.message.reply_text(
+                "Вы вернулись в главное меню.",
+                reply_markup=MENU,
+            )
+    except Exception:
+        reset_user_state(update, context)
+        logger.exception("Ошибка при возврате в главное меню")
+        await send_error_message(update, ERROR_TEXT)
+
+
+def parse_task_date(value: str) -> str | None:
+    normalized = value.strip().lower()
+    today = local_today().date()
+    if normalized == "сегодня":
+        return today.strftime("%d.%m.%Y")
+    if normalized == "завтра":
+        return (today + timedelta(days=1)).strftime("%d.%m.%Y")
+
+    for date_format in ("%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value.strip(), date_format).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return None
+
+
+def parse_deadline(value: str) -> str | None:
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value.strip())
+    if not match:
+        return None
+    return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+
+async def reply_invalid(
+    update: Update,
+    reply_markup: ReplyKeyboardMarkup,
+) -> None:
+    if update.message:
+        await update.message.reply_text(
+            INVALID_INPUT_TEXT,
+            reply_markup=reply_markup,
+        )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Безопасная точка входа для обычных текстовых сообщений."""
+    try:
+        await handle_text_safely(update, context)
+    except Exception:
+        reset_user_state(update, context)
+        logger.exception("Ошибка при обработке сообщения пользователя")
+        await send_error_message(update, INVALID_INPUT_TEXT)
+
+
+async def handle_text_safely(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not update.message or update.message.text is None:
+        return
+
+    message_text = update.message.text.strip()
+    user_id = get_user_id(update)
+    mode = context.user_data.get("mode")
+
+    # Защита для тестов и нестандартных обновлений: в приложении этот текст
+    # перехватывается первым зарегистрированным MessageHandler.
+    if message_text == BACK_BUTTON:
+        await handle_back_to_menu(update, context)
+        return
+
+    if message_text == "📋 Задачи":
+        await show_tasks_menu(update, context)
+        return
+    if message_text in {"📋 Задачи на сегодня", "📝 Задачи на сегодня"}:
+        await show_tasks(update, context)
+        return
+    if message_text == "➕ Добавить задачу":
+        await ask_for_task(update, context)
+        return
+
+    if message_text == "📚 Расписание уроков":
+        await show_schedule_menu(update, context)
+        return
+    if message_text == "📅 Расписание уроков":
+        await show_schedule_menu(update, context)
+        return
+    if message_text == "📅 Сегодня":
+        reset_user_state(update, context)
+        if user_id is not None:
+            await send_schedule_view(
+                update,
+                schedule_day_text(user_id, 0),
+                context,
+            )
+        return
+    if message_text == "📆 Завтра":
+        reset_user_state(update, context)
+        if user_id is not None:
+            await send_schedule_view(
+                update,
+                schedule_day_text(user_id, 1),
+                context,
+            )
+        return
+    if message_text == "🗓️ Вся неделя":
+        reset_user_state(update, context)
+        if user_id is not None:
+            await send_schedule_view(update, schedule_text(user_id), context)
+        return
+    if message_text == "✏️ Изменить расписание":
+        await show_schedule_editor(update, context)
+        return
+
+    if message_text == "🤖 ИИ-Решебник задач":
+        reset_user_state(update, context)
+        context.user_data["mode"] = "solve"
+        if update.message:
+            await update.message.reply_text(
+                "🤖 ИИ-Решебник\n"
+                "Отправь мне условие задачи или вопрос по любому предмету. "
+                "Чтобы выйти из режима — нажми кнопку ниже.",
+                reply_markup=SUBMENU_MENU,
+            )
+        return
+
+    if message_text == "📸 Решить по фото":
+        reset_user_state(update, context)
+        context.user_data["mode"] = "solve_photo"
+        if update.message:
+            await update.message.reply_text(
+                "📸 Отправь фотографию с условием задачи.",
+                reply_markup=SUBMENU_MENU,
+            )
+        return
+
+    if user_id is None:
+        raise ValueError("Не найден пользователь")
+
+    if mode == "add_task_subject":
+        if not message_text:
+            await reply_invalid(update, TASKS_MENU)
+            return
+        context.user_data.setdefault("draft_task", {})["subject"] = message_text
+        context.user_data["mode"] = "add_task_title"
+        await update.message.reply_text(
+            "📝 Введите название задания.",
+            reply_markup=TASKS_MENU,
+        )
+        return
+
+    if mode == "add_task_title":
+        if not message_text:
+            await reply_invalid(update, TASKS_MENU)
+            return
+        context.user_data.setdefault("draft_task", {})["title"] = message_text
+        context.user_data["mode"] = "add_task_date"
+        await update.message.reply_text(
+            "📅 Введите дату в формате ДД.ММ.ГГГГ.\n"
+            "Можно также написать «сегодня» или «завтра».",
+            reply_markup=TASKS_MENU,
+        )
+        return
+
+    if mode == "add_task_date":
+        parsed_date = parse_task_date(message_text)
+        if not parsed_date:
+            await reply_invalid(update, TASKS_MENU)
+            return
+        context.user_data.setdefault("draft_task", {})["date"] = parsed_date
+        context.user_data["mode"] = "add_task_deadline"
+        await update.message.reply_text(
+            "⏰ Введите дедлайн в формате ЧЧ:ММ, например 18:30.",
+            reply_markup=TASKS_MENU,
+        )
+        return
+
+    if mode == "add_task_deadline":
+        deadline = parse_deadline(message_text)
+        if not deadline:
+            await reply_invalid(update, TASKS_MENU)
+            return
+        context.user_data.setdefault("draft_task", {})["deadline"] = deadline
+        context.user_data["mode"] = "add_task_reminder"
+        await update.message.reply_text(
+            "🔔 Настроить напоминание?",
+            reply_markup=REMINDER_MENU,
+        )
+        return
+
+    if mode == "add_task_reminder":
+        reminder_values = {
+            "✅ Да": True,
+            "❌ Нет": False,
+            "Да": True,
+            "Нет": False,
+        }
+        if message_text not in reminder_values:
+            await reply_invalid(update, REMINDER_MENU)
+            return
+
+        global next_task_id
+        draft = context.user_data.get("draft_task", {})
+        task = {
+            "id": next_task_id,
+            "subject": draft.get("subject", ""),
+            "title": draft.get("title", ""),
+            "date": draft.get("date", ""),
+            "deadline": draft.get("deadline", ""),
+            "reminder": reminder_values[message_text],
+            "completed": False,
+        }
+        tasks_by_user.setdefault(user_id, []).append(task)
+        next_task_id += 1
+        reset_input_state(context)
+        await update.message.reply_text(
+            "✅ Задача добавлена!\n\n" + task_line(1, task),
+            reply_markup=TASKS_MENU,
+        )
+        return
+
+    if mode == "edit_task_title":
+        task_id = context.user_data.get("selected_task_id")
+        if not isinstance(task_id, int) or not message_text:
+            await reply_invalid(update, TASKS_MENU)
+            return
+        task = find_task(user_id, task_id)
+        if task is None:
+            raise ValueError("Задача не найдена")
+        task["title"] = message_text
+        reset_input_state(context)
+        await update.message.reply_text(
+            "✅ Задача изменена.\n\n" + tasks_text(user_id),
+            reply_markup=TASKS_MENU,
+        )
+        return
+
+    if mode == "move_task_date":
+        task_id = context.user_data.get("selected_task_id")
+        parsed_date = parse_task_date(message_text)
+        if not isinstance(task_id, int) or not parsed_date:
+            await reply_invalid(update, TASKS_MENU)
+            return
+        task = find_task(user_id, task_id)
+        if task is None:
+            raise ValueError("Задача не найдена")
+        task["date"] = parsed_date
+        reset_input_state(context)
+        await update.message.reply_text(
+            "✅ Задача перенесена.\n\n" + tasks_text(user_id),
+            reply_markup=TASKS_MENU,
+        )
+        return
+
+    if mode == "add_schedule":
+        day = context.user_data.get("schedule_day")
+        if day not in WEEKDAYS or not message_text:
+            await reply_invalid(update, SCHEDULE_MENU)
+            return
+        schedule_by_user.setdefault(user_id, {})[day] = message_text
+        reset_input_state(context)
+        await update.message.reply_text(
+            f"✅ Расписание на {day} сохранено.",
+            reply_markup=SCHEDULE_MENU,
+        )
+        return
+
+    if mode in {"choose_schedule_day", "task_select_action"}:
+        await reply_invalid(
+            update,
+            SCHEDULE_MENU if mode == "choose_schedule_day" else TASKS_MENU,
+        )
+        return
+    if "Главное меню" in message_text or "Меню" in message_text:
+        reset_user_state(update, context)
+        await update.message.reply_text(
+            "🏠 Главное меню. Выберите раздел:",
+            reply_markup=MENU
+        )
+        return
+    elif "Задачи" in message_text:
+        await update.message.reply_text(
+            "📋 Раздел «Задачи». Выберите действие:",
+            reply_markup=TASKS_MENU
+        )
+        return
+    elif "Расписание" in message_text:
+        await update.message.reply_text(
+            "📚 Раздел «Расписание уроков». Выберите действие:",
+            reply_markup=SCHEDULE_MENU
+        )
+        return
+    elif "Решебник" in message_text or "ИИ" in message_text:
+        context.user_data["mode"] = "solve"
+        await update.message.reply_text(
+            "🤖 ИИ-Решебник\nОтправь мне условие задачи или вопрос по любому предмету. Чтобы выйти из режима — нажми кнопку ниже.",
+            reply_markup=MENU
+        )
+        return
+
+    if mode == "solve":
+        await context.bot.send_chat_action(update.message.chat.id, "typing")
+        await update.message.reply_text(
+            "⏳ Думаю над решением. Это может занять несколько секунд..."
+        )
+        cancel_ai_task(user_id)
+        ai_task = asyncio.create_task(
+            process_ai_request(update, context, message_text, user_id)
+        )
+        ai_tasks_by_user[user_id] = ai_task
+        return
+
+    await update.message.reply_text(
+        "Выберите раздел с помощью кнопок ниже.",
+        reply_markup=MENU,
+    )
+
+
+async def handle_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Принять фото в любом режиме и запустить его обработку."""
+    if not update.message or not update.message.photo:
+        return
+
+    user_id = get_user_id(update)
+    if user_id is None:
+        return
+
+    try:
+        reset_user_state(update, context)
+        context.user_data["mode"] = "solve_photo"
+        await update.message.reply_text(PHOTO_PROGRESS_TEXT)
+
+        photo = max(
+            update.message.photo,
+            key=lambda item: (item.width * item.height, item.file_size or 0),
+        )
+        photo_task = asyncio.create_task(
+            process_photo_request(update, context, photo.file_id, user_id)
+        )
+        ai_tasks_by_user[user_id] = photo_task
+    except Exception:
+        reset_user_state(update, context)
+        logger.exception("Не удалось запустить обработку фото")
+        await update.message.reply_text(PHOTO_ERROR_TEXT, reply_markup=MENU)
+
+
+def main() -> None:
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token:
+        raise RuntimeError(
+            "BOT_TOKEN is missing. Add your Telegram bot token as a secret named BOT_TOKEN."
+        )
+
+    start_keep_alive_server()
+    application = Application.builder().token(bot_token).build()
+
+    # Этот обработчик зарегистрирован первым, чтобы выход не ждал другие шаги.
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^🔙 Главное меню$"), handle_back_to_menu)
+    )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
+
+    print("Школьный бот запущен. Нажмите Ctrl+C, чтобы остановить его.")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
